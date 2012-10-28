@@ -130,11 +130,7 @@ int main(int argc, char **argv) {
                     }
                     pd = cd->parser->data;
                     if (pd->complete) {
-                        char *url = malloc(pd->urllen+1);
-                        memcpy(url, pd->url_at, pd->urllen);
-                        url[pd->urllen] = '\0';
-                        printf("Got a request for: %s\n", url);
-                        free(url);
+                        printf("Got a request for: %.*s\n", pd->urllen, pd->url_at);
                     }
                 }
             }

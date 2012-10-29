@@ -46,7 +46,16 @@ typedef struct ltng_conn {
     struct in_addr raddr;
     in_port_t rport;
     unsigned char close;
+    unsigned char state; // ltng_conn_state
 } ltng_conn;
+
+typedef enum ltng_conn_state {
+    HTTP_HEADER_NONE = 0,
+    HTTP_HEADER_CONNECTION,
+    HTTP_HEADER_ETAG, // TODO I want more than 1 enum value ;)
+    HTTP_HEADER_DONTCARE,
+    RESPONSE_SENT
+} ltng_conn_state;
 
 int ltng_conn_new(int lfd, int epfd) {
     // will static speed this up? I suspect it will just cause page faults.
@@ -68,6 +77,7 @@ int ltng_conn_new(int lfd, int epfd) {
     c->url = c->last_header = c->last_value = NULL;
     c->url_len = c->last_header_len = c->last_value_len = -1;
     c->close = 0;
+    c->state = HTTP_HEADER_NONE;
 
     c->cfd = or_die("accept", accept4(lfd, (struct sockaddr*) &raddr, &raddr_len, SOCK_NONBLOCK));
     c->raddr = raddr.sin_addr;
@@ -105,6 +115,20 @@ int http_header_cb(http_parser *p, const char *at, size_t length) {
     ltng_conn *c = p->data;
     c->last_header = at;
     c->last_header_len = length;
+
+    if (c->state && c->state != HTTP_HEADER_DONTCARE) {
+        switch (c->state) {
+        case HTTP_HEADER_CONNECTION:
+            if (strncasecmp(c->last_value, "keep-alive", c->last_value_len) == 0) {
+                c->close = 0;
+            } else {
+                c->close = 1;
+            }
+            break;
+        }
+    }
+    c->state = HTTP_HEADER_NONE;
+
 #ifndef NDEBUG
     printf("Parsed header field chunk: %.*s\n", length, at);
 #endif
@@ -115,6 +139,17 @@ int http_value_cb(http_parser *p, const char *at, size_t length) {
     ltng_conn *c = p->data;
     c->last_value = at;
     c->last_value_len = length;
+
+    if (c->state == HTTP_HEADER_NONE) {
+        if (strncasecmp(c->last_header, "Connection", c->last_header_len) == 0) {
+            c->state = HTTP_HEADER_CONNECTION;
+        } else if (strncasecmp(c->last_header, "ETag", c->last_header_len) == 0) {
+            c->state = HTTP_HEADER_ETAG;
+        } else {
+            c->state = HTTP_HEADER_DONTCARE;
+        }
+    }
+
 #ifndef NDEBUG
     printf("Parsed header value chunk: %.*s\n", length, at);
 #endif
@@ -123,9 +158,21 @@ int http_value_cb(http_parser *p, const char *at, size_t length) {
 
 int http_headers_complete_cb(http_parser *p) {
     ltng_conn *c = p->data;
+    if (c->state && c->state != HTTP_HEADER_DONTCARE) {
+        switch (c->state) {
+        case HTTP_HEADER_CONNECTION:
+            if (strncasecmp(c->last_value, "keep-alive", c->last_value_len) == 0) {
+                c->close = 0;
+            } else {
+                c->close = 1;
+            }
+            break;
+        }
+    }
 #ifndef NDEBUG
-    printf("Got request: %.*s\n", c->url_len, c->url);
+    printf("Got connection %s request: %.*s\n", c->close ? "close" : "keep-alive", c->url_len, c->url);
 #endif
+
     return 0;
 }
 
@@ -135,7 +182,7 @@ int ltng_conn_execute(ltng_conn *c, int epfd) {
         .on_header_field = http_header_cb,
         .on_header_value = http_value_cb,
         .on_headers_complete = http_headers_complete_cb
-    }; // TODO this is weird.
+    }; // FIXME this is weird.
 
     int len, nparsed;
     http_parser *p = c->parser;
@@ -152,6 +199,15 @@ int ltng_conn_execute(ltng_conn *c, int epfd) {
         if (nparsed == 0 || nparsed != len) {
             ltng_conn_destroy(c, epfd);
             return 0;
+        }
+
+        if (c->state == RESPONSE_SENT) {
+            // if Connection: close then just close connection, else restart the buffer
+            if (c->close) {
+                ltng_conn_destroy(c, epfd);
+            } else {
+                c->buffer_offset = 0;
+            }
         }
     }
 }

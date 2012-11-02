@@ -1,4 +1,4 @@
-#CFLAGS = -O3 -mtune=native -fomit-frame-pointer
+#CFLAGS = -O3 -mtune=native
 CFLAGS = -g
 SRCS = $(wildcard *.c)
 OBJS = $(SRCS:%.c=%.o)

@@ -7,10 +7,13 @@
 
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
+#include <sys/sendfile.h>
 
 #include "http-parser/http_parser.h"
 
@@ -43,6 +46,7 @@ typedef struct ltng_conn {
     size_t last_value_len;
     size_t buffer_offset;
     int cfd;
+    int epfd;
     struct in_addr raddr;
     in_port_t rport;
     unsigned char close;
@@ -71,6 +75,7 @@ int ltng_conn_new(int lfd, int epfd) {
     c->parser = p;
     p->data = c;
     ev.data.ptr = c;
+    c->epfd = epfd;
 
     c->buffer = malloc(pagesize);
     c->buffer_offset = 0;
@@ -90,8 +95,8 @@ int ltng_conn_new(int lfd, int epfd) {
     return 0;
 }
 
-int ltng_conn_destroy(ltng_conn *c, int epfd) {
-    or_die("epoll_ctl hup", epoll_ctl(epfd, EPOLL_CTL_DEL, c->cfd, NULL));
+int ltng_conn_destroy(ltng_conn *c) {
+    or_die("epoll_ctl hup", epoll_ctl(c->epfd, EPOLL_CTL_DEL, c->cfd, NULL));
     or_die("close", close(c->cfd));
 #ifndef NDEBUG
     printf("Closed connection from %s:%hu\n", inet_ntoa(c->raddr), c->rport);
@@ -176,12 +181,45 @@ int http_headers_complete_cb(http_parser *p) {
     return 0;
 }
 
+int respond_file(ltng_conn *c) {
+    int ffd;
+    size_t fsize;
+    char *fname = malloc(c->url_len+1); // FIXME better than malloc plz
+    strncpy(fname, c->url, c->url_len);
+    fname[c->url_len] = '\0';
+    printf("opening %s\n", fname[0] == '/' ? fname+1 : fname);
+    ffd = open(fname[0] == '/' ? fname+1 : fname, O_RDONLY);
+    puts("lseeking");
+    fsize = lseek(ffd, 0, SEEK_END);
+    puts("rewinding");
+    lseek(ffd, 0, SEEK_SET);
+    puts("sending header");
+    send(c->cfd, "HTTP/1.1 200 Ok\r\nServer: LTNG\r\n\r\n", strlen("HTTP/1.1 200 Ok\r\nServer: LTNG\r\n\r\n"), 0);
+    puts("splicing");
+    sendfile(c->cfd, ffd, NULL, fsize);
+    puts("done");
+    c->close = 1;
+}
+
+int http_message_complete_cb(http_parser *p) {
+    ltng_conn *c = p->data;
+    //static char *msg = "HTTP/1.1 200 Ok\r\nServer: LTNG\r\nContent-Length: 13\r\nContent-Type: text/plain\r\n\r\nHello Chrome!";
+    //write(c->cfd, msg, strlen(msg));
+
+    respond_file(c);
+
+    c->state = RESPONSE_SENT;
+
+    return 0;
+}
+
 int ltng_conn_execute(ltng_conn *c, int epfd) {
     http_parser_settings parser_settings = {
         .on_url = http_url_cb,
         .on_header_field = http_header_cb,
         .on_header_value = http_value_cb,
-        .on_headers_complete = http_headers_complete_cb
+        .on_headers_complete = http_headers_complete_cb,
+        .on_message_complete = http_message_complete_cb
     }; // FIXME this is weird.
 
     int len, nparsed;
@@ -196,17 +234,18 @@ int ltng_conn_execute(ltng_conn *c, int epfd) {
         c->buffer_offset += len;
 
         nparsed = http_parser_execute(p, &parser_settings, c->buffer, len);
-        if (nparsed == 0 || nparsed != len) {
-            ltng_conn_destroy(c, epfd);
+        printf("len: %d, buffer_offset: %d, nparsed: %d\n", len, c->buffer_offset, nparsed);
+        if (len == 0 || nparsed != len) {
+            ltng_conn_destroy(c);
             return 0;
         }
-
         if (c->state == RESPONSE_SENT) {
-            // if Connection: close then just close connection, else restart the buffer
             if (c->close) {
-                ltng_conn_destroy(c, epfd);
+                ltng_conn_destroy(c);
+                return 0;
             } else {
                 c->buffer_offset = 0;
+                c->state = HTTP_HEADER_NONE;
             }
         }
     }

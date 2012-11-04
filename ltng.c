@@ -81,7 +81,7 @@ int ltng_conn_new(int lfd, int epfd) {
     c->buffer_offset = 0;
     c->url = c->last_header = c->last_value = NULL;
     c->url_len = c->last_header_len = c->last_value_len = -1;
-    c->close = 0;
+    c->close = 1;
     c->state = HTTP_HEADER_NONE;
 
     c->cfd = or_die("accept", accept4(lfd, (struct sockaddr*) &raddr, &raddr_len, SOCK_NONBLOCK));
@@ -182,23 +182,27 @@ int http_headers_complete_cb(http_parser *p) {
 }
 
 int respond_file(ltng_conn *c) {
+    char buffer[pagesize]; // max request size, thus is safe
     int ffd;
-    size_t fsize;
-    char *fname = malloc(c->url_len+1); // FIXME better than malloc plz
-    strncpy(fname, c->url, c->url_len);
-    fname[c->url_len] = '\0';
-    printf("opening %s\n", fname[0] == '/' ? fname+1 : fname);
-    ffd = open(fname[0] == '/' ? fname+1 : fname, O_RDONLY);
-    puts("lseeking");
+    int len, fsize;
+    strncpy(buffer, c->url, c->url_len);
+    buffer[c->url_len] = '\0';
+    ffd = open(buffer[0] == '/' ? buffer+1 : buffer, O_RDONLY);
     fsize = lseek(ffd, 0, SEEK_END);
-    puts("rewinding");
+#ifndef NDEBUG
+    printf("Opened %d byte file %s\n", fsize, buffer);
+#endif
     lseek(ffd, 0, SEEK_SET);
-    puts("sending header");
-    send(c->cfd, "HTTP/1.1 200 Ok\r\nServer: LTNG\r\n\r\n", strlen("HTTP/1.1 200 Ok\r\nServer: LTNG\r\n\r\n"), 0);
-    puts("splicing");
+    len = snprintf(buffer, 4096, "HTTP/1.1 200 Ok\r\nServer: LTNG\r\n%sContent-Length: %d\r\nContent-Type: text/plain\r\n\r\n", c->close ? "" : "Connection: Keep-Alive\r\n", fsize);
+#ifndef NDEBUG
+    puts(buffer);
+#endif
+    send(c->cfd, buffer, len, MSG_MORE);
     sendfile(c->cfd, ffd, NULL, fsize);
-    puts("done");
-    c->close = 1;
+#ifndef NDEBUG
+    puts("file sent");
+#endif
+    return 0;
 }
 
 int http_message_complete_cb(http_parser *p) {
@@ -234,16 +238,24 @@ int ltng_conn_execute(ltng_conn *c, int epfd) {
         c->buffer_offset += len;
 
         nparsed = http_parser_execute(p, &parser_settings, c->buffer, len);
+#ifndef NDEBUG
         printf("len: %d, buffer_offset: %d, nparsed: %d\n", len, c->buffer_offset, nparsed);
+#endif
         if (len == 0 || nparsed != len) {
             ltng_conn_destroy(c);
             return 0;
         }
         if (c->state == RESPONSE_SENT) {
             if (c->close) {
+#ifndef NDEBUG
+                puts("closing because of connection close");
+#endif
                 ltng_conn_destroy(c);
                 return 0;
             } else {
+#ifndef NDEBUG
+                puts("reseting buffer because of connection keep-alive");
+#endif
                 c->buffer_offset = 0;
                 c->state = HTTP_HEADER_NONE;
             }

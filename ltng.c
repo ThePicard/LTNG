@@ -199,6 +199,7 @@ int respond_file(ltng_conn *c) {
 #endif
     send(c->cfd, buffer, len, MSG_MORE);
     sendfile(c->cfd, ffd, NULL, fsize);
+    close(ffd);
 #ifndef NDEBUG
     puts("file sent");
 #endif
